@@ -2280,15 +2280,59 @@ impl AhoCorasickBuilder {
         // is shrinking the table (16-bit state ids halve it), not raising
         // the cap.
         const DFA_AUTO_MEMORY_LIMIT: usize = 6 << 20;
-        let dfa_size = nfa
-            .states_len()
-            .saturating_mul(
-                nfa.byte_classes().alphabet_len().next_power_of_two(),
-            )
-            .saturating_mul(core::mem::size_of::<u32>());
-        let try_dfa = !matches!(self.start_kind, StartKind::Both)
+        // The half-width DFA stores raw u16 state indices, halving the
+        // table for the same automaton. It takes ONLY the band the
+        // full-width cap excludes (u32 table in 6..=24MB, u16 indices
+        // still representable): there the halved footprint is what keeps
+        // prose scans cache-resident (measured -13..-35% on 64k-state
+        // dictionary sets over prose, and -13..-29% on their walk/batch
+        // rows). It does NOT replace the full-width DFA below the 6MB
+        // cap: those tables are already cache-resident, the scan is
+        // bound by the load->address->load dependency chain, and the
+        // extra shift in the u16 row addressing measurably loses there
+        // (+10..28% on midsize prose when tried).
+        //
+        // The residual cost of admitting the 6..12MB band is input-
+        // dependent, exactly like the 24MB experiment above but at half
+        // the magnitude: haystacks that dwell deep in a 64k-state
+        // automaton (dense multi-stop synthetic input) measured +28..59%
+        // because the walk touches the whole 8.5MB table where the
+        // contiguous NFA it displaces stays ~1MB. Prose input on the
+        // same automaton wins big, and the same-dictionary rows cannot
+        // be separated at build time, so this accepts the dense-input
+        // downside for the prose upside.
+        const DFA16_AUTO_MEMORY_LIMIT: usize = 12 << 20;
+        let cells = nfa.states_len().saturating_mul(
+            nfa.byte_classes().alphabet_len().next_power_of_two(),
+        );
+        let dfa_size = cells.saturating_mul(core::mem::size_of::<u32>());
+        let dfa16_size = cells.saturating_mul(core::mem::size_of::<u16>());
+        // A DFA table only pays off with one start-state flavor; StartKind::
+        // Both doubles the table, so it always falls through to the NFAs.
+        let one_start = !matches!(self.start_kind, StartKind::Both);
+        let try_dfa = one_start
             && (nfa.patterns_len() <= 100
                 || dfa_size <= DFA_AUTO_MEMORY_LIMIT);
+        let fits_u16 = nfa.states_len() <= usize::from(u16::MAX) + 1;
+        let try_dfa16 = one_start
+            && !try_dfa
+            && fits_u16
+            && dfa16_size <= DFA16_AUTO_MEMORY_LIMIT;
+        if try_dfa16 {
+            match self.dfa.build_u16_from_noncontiguous(&nfa) {
+                Ok(dfa) => {
+                    debug!("chose a half-width DFA (u16 state indices)");
+                    return (Arc::new(dfa), AhoCorasickKind::DFA);
+                }
+                Err(_err) => {
+                    debug!(
+                        "failed to build half-width DFA, \
+                         trying something else: {}",
+                        _err
+                    );
+                }
+            }
+        }
         if try_dfa {
             match self.dfa.build_from_noncontiguous(&nfa) {
                 Ok(dfa) => {

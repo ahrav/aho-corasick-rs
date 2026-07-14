@@ -31,6 +31,7 @@ pub(crate) mod private {
 impl private::Sealed for crate::nfa::noncontiguous::NFA {}
 impl private::Sealed for crate::nfa::contiguous::NFA {}
 impl private::Sealed for crate::dfa::DFA {}
+impl private::Sealed for crate::dfa::DFA16 {}
 
 impl<'a, T: private::Sealed + ?Sized> private::Sealed for &'a T {}
 

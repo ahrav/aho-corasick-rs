@@ -380,6 +380,299 @@ impl core::fmt::Debug for DFA {
     }
 }
 
+/// A half-width DFA: the same automaton as [`DFA`], with the transition
+/// table stored as raw (non-premultiplied) `u16` state indices.
+///
+/// Where `DFA` stores premultiplied `u32` ids (`index << stride2`), this
+/// stores the bare state index and computes the row address at search
+/// time: `(index << stride2) + class`. The shift folds into the address
+/// arithmetic on the load, so a transition costs the same instruction
+/// count while the table occupies half the memory. Premultiplied `u16`
+/// ids are deliberately NOT used: the maximum premultiplied id needs
+/// `log2(states) + stride2` bits, which overflows `u16` for exactly the
+/// dictionary-scale automatons this representation exists for.
+///
+/// Special-state detection is unchanged: states are sorted so that dead,
+/// match and start states occupy the lowest indices, and `>> stride2` is
+/// order-preserving, so the id-range comparisons in `is_special`,
+/// `is_match` and `is_dead` work directly on the raw indices.
+///
+/// Eligibility: every state index must fit in `u16`, i.e.
+/// `state_len <= 65536`. Built via `Builder::build_u16_from_noncontiguous`;
+/// selected automatically by `AhoCorasickBuilder` and reported as
+/// [`AhoCorasickKind::DFA`](crate::AhoCorasickKind::DFA).
+#[derive(Clone)]
+pub(crate) struct DFA16 {
+    /// The DFA transition table, storing raw (NOT premultiplied) state
+    /// indices. The entry for state index `i` and equivalence class `c`
+    /// lives at `(i << stride2) + c`.
+    trans: Vec<u16>,
+    /// The matches for every match state, indexed by `state_index - 2`
+    /// (the dead and fail states occupy indices 0 and 1 and never match).
+    matches: Vec<Vec<PatternID>>,
+    /// The amount of heap memory used, in bytes, by the inner Vecs of
+    /// 'matches'.
+    matches_memory_usage: usize,
+    /// The length of each pattern, for computing match start offsets.
+    pattern_lens: Vec<SmallIndex>,
+    /// A prefilter for accelerating searches, if one exists.
+    prefilter: Option<Prefilter>,
+    /// The match semantics built into this DFA.
+    match_kind: MatchKind,
+    /// The total number of states in this DFA.
+    state_len: usize,
+    /// The alphabet size (total number of equivalence classes).
+    alphabet_len: usize,
+    /// The exponent with a base 2, such that stride=2^stride2.
+    stride2: usize,
+    /// The equivalence classes for this DFA.
+    byte_classes: ByteClasses,
+    /// The length of the shortest pattern in this automaton.
+    min_pattern_len: usize,
+    /// The length of the longest pattern in this automaton.
+    max_pattern_len: usize,
+    /// The information required to deduce which states are "special".
+    /// All ids here are raw state indices.
+    special: Special,
+}
+
+impl DFA16 {
+    /// A sentinel state ID indicating that a search should stop. Index 0 is
+    /// the dead state in both the full-width and half-width layouts.
+    const DEAD: StateID = StateID::new_unchecked(0);
+
+    /// Narrows a full-width DFA to u16 state indices.
+    ///
+    /// Returns an error if any state index does not fit in `u16`. The
+    /// conversion divides every premultiplied id by the stride; state
+    /// order (and thus the special-state ranges) is preserved.
+    fn from_full_width(dfa: DFA) -> Result<DFA16, BuildError> {
+        if dfa.state_len > usize::from(u16::MAX) + 1 {
+            return Err(BuildError::state_id_overflow(
+                u64::from(u16::MAX),
+                (dfa.state_len - 1).as_u64(),
+            ));
+        }
+        let stride2 = dfa.stride2;
+        let unshift =
+            |sid: StateID| StateID::new_unchecked(sid.as_usize() >> stride2);
+        let trans: Vec<u16> = dfa
+            .trans
+            .iter()
+            .map(|&sid| (sid.as_usize() >> stride2).as_u16())
+            .collect();
+        let special = Special {
+            max_special_id: unshift(dfa.special.max_special_id),
+            max_match_id: unshift(dfa.special.max_match_id),
+            start_unanchored_id: unshift(dfa.special.start_unanchored_id),
+            start_anchored_id: unshift(dfa.special.start_anchored_id),
+        };
+        Ok(DFA16 {
+            trans,
+            matches: dfa.matches,
+            matches_memory_usage: dfa.matches_memory_usage,
+            pattern_lens: dfa.pattern_lens,
+            prefilter: dfa.prefilter,
+            match_kind: dfa.match_kind,
+            state_len: dfa.state_len,
+            alphabet_len: dfa.alphabet_len,
+            stride2,
+            byte_classes: dfa.byte_classes,
+            min_pattern_len: dfa.min_pattern_len,
+            max_pattern_len: dfa.max_pattern_len,
+            special,
+        })
+    }
+}
+
+// SAFETY: 'start_state' always returns a valid state ID, 'next_state' always
+// returns a valid state ID given a valid state ID (every table entry is a
+// state index narrowed from the full-width DFA, whose table only contains
+// valid ids). We otherwise claim that all other methods are correct as well.
+unsafe impl Automaton for DFA16 {
+    #[inline(always)]
+    fn start_state(&self, anchored: Anchored) -> Result<StateID, MatchError> {
+        match anchored {
+            Anchored::No => {
+                let start = self.special.start_unanchored_id;
+                if start == DFA16::DEAD {
+                    Err(MatchError::invalid_input_unanchored())
+                } else {
+                    Ok(start)
+                }
+            }
+            Anchored::Yes => {
+                let start = self.special.start_anchored_id;
+                if start == DFA16::DEAD {
+                    Err(MatchError::invalid_input_anchored())
+                } else {
+                    Ok(start)
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn next_state(
+        &self,
+        _anchored: Anchored,
+        sid: StateID,
+        byte: u8,
+    ) -> StateID {
+        let class = self.byte_classes.get(byte);
+        let index = (sid.as_usize() << self.stride2) + usize::from(class);
+        StateID::new_unchecked(usize::from(self.trans[index]))
+    }
+
+    #[inline(always)]
+    fn is_special(&self, sid: StateID) -> bool {
+        sid <= self.special.max_special_id
+    }
+
+    #[inline(always)]
+    fn is_dead(&self, sid: StateID) -> bool {
+        sid == DFA16::DEAD
+    }
+
+    #[inline(always)]
+    fn is_match(&self, sid: StateID) -> bool {
+        !self.is_dead(sid) && sid <= self.special.max_match_id
+    }
+
+    #[inline(always)]
+    fn is_start(&self, sid: StateID) -> bool {
+        sid == self.special.start_unanchored_id
+            || sid == self.special.start_anchored_id
+    }
+
+    #[inline(always)]
+    fn match_kind(&self) -> MatchKind {
+        self.match_kind
+    }
+
+    #[inline(always)]
+    fn patterns_len(&self) -> usize {
+        self.pattern_lens.len()
+    }
+
+    #[inline(always)]
+    fn pattern_len(&self, pid: PatternID) -> usize {
+        self.pattern_lens[pid].as_usize()
+    }
+
+    #[inline(always)]
+    fn min_pattern_len(&self) -> usize {
+        self.min_pattern_len
+    }
+
+    #[inline(always)]
+    fn max_pattern_len(&self) -> usize {
+        self.max_pattern_len
+    }
+
+    #[inline(always)]
+    fn match_len(&self, sid: StateID) -> usize {
+        debug_assert!(self.is_match(sid));
+        self.matches[sid.as_usize() - 2].len()
+    }
+
+    #[inline(always)]
+    fn match_pattern(&self, sid: StateID, index: usize) -> PatternID {
+        debug_assert!(self.is_match(sid));
+        self.matches[sid.as_usize() - 2][index]
+    }
+
+    #[inline(always)]
+    fn memory_usage(&self) -> usize {
+        use core::mem::size_of;
+
+        (self.trans.len() * size_of::<u16>())
+            + (self.matches.len() * size_of::<Vec<PatternID>>())
+            + self.matches_memory_usage
+            + (self.pattern_lens.len() * size_of::<SmallIndex>())
+            + self.prefilter.as_ref().map_or(0, |p| p.memory_usage())
+    }
+
+    #[inline(always)]
+    fn prefilter(&self) -> Option<&Prefilter> {
+        self.prefilter.as_ref()
+    }
+}
+
+impl core::fmt::Debug for DFA16 {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        use crate::{
+            automaton::{fmt_state_indicator, sparse_transitions},
+            util::debug::DebugByte,
+        };
+
+        writeln!(f, "dfa::DFA16(")?;
+        for index in 0..self.state_len {
+            let sid = StateID::new_unchecked(index);
+            // The FAIL state is never used at search time but does occupy
+            // a row in the table; see the corresponding comment in the
+            // full-width DFA's Debug impl.
+            if index == 1 {
+                writeln!(f, "F {:06}:", sid.as_usize())?;
+                continue;
+            }
+            fmt_state_indicator(f, self, sid)?;
+            write!(f, "{:06}: ", sid.as_usize())?;
+
+            let it = (0..self.byte_classes.alphabet_len()).map(|class| {
+                let next =
+                    usize::from(self.trans[(index << self.stride2) + class]);
+                (class.as_u8(), StateID::new_unchecked(next))
+            });
+            for (i, (start, end, next)) in sparse_transitions(it).enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                if start == end {
+                    write!(
+                        f,
+                        "{:?} => {:?}",
+                        DebugByte(start),
+                        next.as_usize()
+                    )?;
+                } else {
+                    write!(
+                        f,
+                        "{:?}-{:?} => {:?}",
+                        DebugByte(start),
+                        DebugByte(end),
+                        next.as_usize()
+                    )?;
+                }
+            }
+            writeln!(f)?;
+            if self.is_match(sid) {
+                write!(f, " matches: ")?;
+                for i in 0..self.match_len(sid) {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    let pid = self.match_pattern(sid, i);
+                    write!(f, "{}", pid.as_usize())?;
+                }
+                writeln!(f)?;
+            }
+        }
+        writeln!(f, "match kind: {:?}", self.match_kind)?;
+        writeln!(f, "prefilter: {:?}", self.prefilter.is_some())?;
+        writeln!(f, "state length: {:?}", self.state_len)?;
+        writeln!(f, "pattern length: {:?}", self.patterns_len())?;
+        writeln!(f, "shortest pattern length: {:?}", self.min_pattern_len)?;
+        writeln!(f, "longest pattern length: {:?}", self.max_pattern_len)?;
+        writeln!(f, "alphabet length: {:?}", self.alphabet_len)?;
+        writeln!(f, "stride: {:?}", 1 << self.stride2)?;
+        writeln!(f, "byte classes: {:?}", self.byte_classes)?;
+        writeln!(f, "memory usage: {:?}", self.memory_usage())?;
+        writeln!(f, ")")?;
+        Ok(())
+    }
+}
+
 /// A builder for configuring an Aho-Corasick DFA.
 ///
 /// This builder has a subset of the options available to a
@@ -537,6 +830,24 @@ impl Builder {
         // might require a fair bit of work to do. It's unclear whether it's
         // worth it.
         Ok(dfa)
+    }
+
+    /// Build a half-width (u16 state index) Aho-Corasick DFA from the given
+    /// noncontiguous NFA.
+    ///
+    /// This determinizes through the full-width builder and then narrows
+    /// the table, so it reuses the (nontrivial) construction logic at the
+    /// cost of transiently holding both tables. Returns an error when the
+    /// automaton has more states than a `u16` index can address.
+    ///
+    /// The same builder-settings caveat as
+    /// [`Builder::build_from_noncontiguous`] applies.
+    pub(crate) fn build_u16_from_noncontiguous(
+        &self,
+        nnfa: &noncontiguous::NFA,
+    ) -> Result<DFA16, BuildError> {
+        let dfa = self.build_from_noncontiguous(nnfa)?;
+        DFA16::from_full_width(dfa)
     }
 
     /// Finishes building a DFA for either unanchored or anchored searches,
