@@ -33,6 +33,30 @@ use crate::{
 pub struct Prefilter {
     finder: Arc<dyn PrefilterI>,
     memory_usage: usize,
+    /// A devirtualized description of `finder` for the variants hot search
+    /// loops want to inline. Candidate-generating prefilters are consulted
+    /// once per root gap; on gap-dense input the virtual call and `Candidate`
+    /// round-trip cost more than the scan they wrap, so the search loops
+    /// match on this and call the underlying kernel directly.
+    inline: InlinePrefilter,
+}
+
+/// A compact, copyable description of a prefilter for inline dispatch in
+/// the search loops. `Dyn` means "no inline form; use `Prefilter::find_in`".
+///
+/// Only prefilters whose candidate is the found position itself (no offset
+/// correction, no confirmed-match short circuit) have inline forms: that
+/// keeps the inlined arms trivially equivalent to their `PrefilterI` impls.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum InlinePrefilter {
+    /// memchr over the sole start byte.
+    One(u8),
+    /// memchr2 over two start bytes.
+    Two(u8, u8),
+    /// memchr3 over three start bytes.
+    Three(u8, u8, u8),
+    /// No inline form.
+    Dyn,
 }
 
 impl Prefilter {
@@ -50,6 +74,13 @@ impl Prefilter {
     #[inline]
     pub(crate) fn memory_usage(&self) -> usize {
         self.memory_usage
+    }
+
+    /// Returns the devirtualized form of this prefilter for inline dispatch
+    /// in search loops.
+    #[inline]
+    pub(crate) fn inline_form(&self) -> InlinePrefilter {
+        self.inline
     }
 }
 
@@ -192,7 +223,11 @@ impl Builder {
                          for consideration",
                         patlen, minlen, memory_usage,
                     );
-                    Prefilter { finder: Arc::new(Packed(s)), memory_usage }
+                    Prefilter {
+                        finder: Arc::new(Packed(s)),
+                        memory_usage,
+                        inline: InlinePrefilter::Dyn,
+                    }
                 });
             (packed, patlen, minlen)
         };
@@ -370,7 +405,11 @@ impl MemmemBuilder {
                 memchr::memmem::Finder::new(pattern).into_owned(),
             ));
             let memory_usage = pattern.len();
-            Some(Prefilter { finder, memory_usage })
+            Some(Prefilter {
+                finder,
+                memory_usage,
+                inline: InlinePrefilter::Dyn,
+            })
         }
 
         #[cfg(not(all(feature = "std", feature = "perf-literal")))]
@@ -588,7 +627,11 @@ impl RareBytesBuilder {
                 }),
                 _ => unreachable!(),
             };
-            Some(Prefilter { finder, memory_usage: 0 })
+            Some(Prefilter {
+                finder,
+                memory_usage: 0,
+                inline: InlinePrefilter::Dyn,
+            })
         }
 
         #[cfg(not(feature = "perf-literal"))]
@@ -818,21 +861,31 @@ impl StartBytesBuilder {
                 bytes[len] = b as u8;
                 len += 1;
             }
-            let finder: Arc<dyn PrefilterI> = match len {
-                0 => return None,
-                1 => Arc::new(StartBytesOne { byte1: bytes[0] }),
-                2 => Arc::new(StartBytesTwo {
-                    byte1: bytes[0],
-                    byte2: bytes[1],
-                }),
-                3 => Arc::new(StartBytesThree {
-                    byte1: bytes[0],
-                    byte2: bytes[1],
-                    byte3: bytes[2],
-                }),
-                _ => unreachable!(),
-            };
-            Some(Prefilter { finder, memory_usage: 0 })
+            let (finder, inline): (Arc<dyn PrefilterI>, InlinePrefilter) =
+                match len {
+                    0 => return None,
+                    1 => (
+                        Arc::new(StartBytesOne { byte1: bytes[0] }),
+                        InlinePrefilter::One(bytes[0]),
+                    ),
+                    2 => (
+                        Arc::new(StartBytesTwo {
+                            byte1: bytes[0],
+                            byte2: bytes[1],
+                        }),
+                        InlinePrefilter::Two(bytes[0], bytes[1]),
+                    ),
+                    3 => (
+                        Arc::new(StartBytesThree {
+                            byte1: bytes[0],
+                            byte2: bytes[1],
+                            byte3: bytes[2],
+                        }),
+                        InlinePrefilter::Three(bytes[0], bytes[1], bytes[2]),
+                    ),
+                    _ => unreachable!(),
+                };
+            Some(Prefilter { finder, memory_usage: 0, inline })
         }
 
         #[cfg(not(feature = "perf-literal"))]
@@ -866,6 +919,7 @@ impl StartBytesBuilder {
         Some(Prefilter {
             finder: Arc::new(StartBytesMany { byteset }),
             memory_usage: 256,
+            inline: InlinePrefilter::Dyn,
         })
     }
 

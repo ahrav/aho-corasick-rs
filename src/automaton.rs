@@ -1300,6 +1300,49 @@ pub(crate) fn try_find_fwd<A: Automaton + ?Sized>(
     }
 }
 
+/// Finds the next prefilter candidate at or after `at`, dispatching
+/// inline for the memchr-kernel prefilters. Candidate-generating
+/// prefilters are consulted once per root gap; the `Arc<dyn>` virtual
+/// call plus `Candidate` round-trip costs as much as scanning a short
+/// gap, so the common kernels are matched and called directly.
+#[cfg(feature = "perf-literal")]
+#[inline(always)]
+fn prefilter_find(
+    pre: &Prefilter,
+    haystack: &[u8],
+    at: usize,
+    end: usize,
+) -> Option<usize> {
+    use crate::util::prefilter::InlinePrefilter;
+    match pre.inline_form() {
+        InlinePrefilter::One(a) => {
+            memchr::memchr(a, &haystack[at..end]).map(|i| at + i)
+        }
+        InlinePrefilter::Two(a, b) => {
+            memchr::memchr2(a, b, &haystack[at..end]).map(|i| at + i)
+        }
+        InlinePrefilter::Three(a, b, c) => {
+            memchr::memchr3(a, b, c, &haystack[at..end]).map(|i| at + i)
+        }
+        InlinePrefilter::Dyn => {
+            pre.find_in(haystack, Span::from(at..end)).into_option()
+        }
+    }
+}
+
+/// The fallback when the memchr crate (and thus the inline kernels) is
+/// unavailable: always the virtual path.
+#[cfg(not(feature = "perf-literal"))]
+#[inline(always)]
+fn prefilter_find(
+    pre: &Prefilter,
+    haystack: &[u8],
+    at: usize,
+    end: usize,
+) -> Option<usize> {
+    pre.find_in(haystack, Span::from(at..end)).into_option()
+}
+
 #[inline(always)]
 fn try_find_fwd_imp<A: Automaton + ?Sized>(
     aut: &A,
@@ -1409,8 +1452,7 @@ fn try_find_fwd_imp<A: Automaton + ?Sized>(
                 // We don't care about 'Candidate::Match' here because if such
                 // a match were possible, it would have been returned above
                 // when we run the prefilter before walking the automaton.
-                let span = Span::from(at..input.end());
-                match pre.find_in(input.haystack(), span).into_option() {
+                match prefilter_find(pre, input.haystack(), at, input.end()) {
                     None => return Ok(None),
                     Some(i) => {
                         if i > at {
@@ -1526,8 +1568,12 @@ fn try_find_overlapping_fwd_imp<A: Automaton + ?Sized>(
                 // dead or a match state AND that a prefilter is active. Thus,
                 // it must be a start state.
                 debug_assert!(aut.is_start(sid));
-                let span = Span::from(state.at..input.end());
-                match pre.find_in(input.haystack(), span).into_option() {
+                match prefilter_find(
+                    pre,
+                    input.haystack(),
+                    state.at,
+                    input.end(),
+                ) {
                     None => return Ok(()),
                     Some(i) => {
                         if i > state.at {
@@ -1599,8 +1645,7 @@ fn try_find_overlapping_collect<A: Automaton + ?Sized>(
                 }
             } else if let Some(pre) = pre {
                 debug_assert!(aut.is_start(sid));
-                let span = Span::from(at..input.end());
-                match pre.find_in(input.haystack(), span).into_option() {
+                match prefilter_find(pre, input.haystack(), at, input.end()) {
                     None => return Ok(()),
                     Some(i) => {
                         if i > at {
