@@ -1233,6 +1233,66 @@ impl AhoCorasick {
         self.aut.try_find_overlapping_collect(&input, matches)
     }
 
+    /// Calls `visit` for every overlapping match in the haystack, in the
+    /// same order [`AhoCorasick::find_overlapping_iter`] would yield them,
+    /// until `visit` returns `false`.
+    ///
+    /// This is the callback form of
+    /// [`AhoCorasick::try_find_overlapping_collect`]: one automaton pass
+    /// that hands each match to `visit` inline, where the iterator pays a
+    /// search re-entry (a virtual call plus state save/restore) per match.
+    /// Use it when matches are consumed on the fly and materializing them
+    /// in a `Vec` is wasted work; the callback costs one indirect call per
+    /// match.
+    ///
+    /// This has the same requirements as overlapping search: the automaton
+    /// must use [`MatchKind::Standard`] semantics.
+    ///
+    /// # Errors
+    ///
+    /// This returns an error when this Aho-Corasick searcher does not support
+    /// the given `Input` configuration or does not use
+    /// [`MatchKind::Standard`] semantics. Matches visited before an error
+    /// (from an anchored-mode mismatch) have already been reported.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use aho_corasick::AhoCorasick;
+    ///
+    /// let patterns = &["append", "appendage", "app"];
+    /// let haystack = "append the app to the appendage";
+    ///
+    /// let ac = AhoCorasick::new(patterns).unwrap();
+    /// let mut count = 0;
+    /// ac.try_find_overlapping_visit(haystack, |_| {
+    ///     count += 1;
+    ///     true
+    /// }).unwrap();
+    /// assert_eq!(6, count); // 3x app, 2x append, 1x appendage
+    ///
+    /// // Returning false stops the search early.
+    /// let mut first = None;
+    /// ac.try_find_overlapping_visit(haystack, |m| {
+    ///     first = Some(m);
+    ///     false
+    /// }).unwrap();
+    /// assert_eq!(Some(2), first.map(|m| m.pattern().as_usize()));
+    /// ```
+    pub fn try_find_overlapping_visit<'h, I, F>(
+        &self,
+        input: I,
+        mut visit: F,
+    ) -> Result<(), MatchError>
+    where
+        I: Into<Input<'h>>,
+        F: FnMut(Match) -> bool,
+    {
+        let input = input.into();
+        enforce_anchored_consistency(self.start_kind, input.get_anchored())?;
+        self.aut.try_find_overlapping_visit(&input, &mut visit)
+    }
+
     /// Returns an iterator of non-overlapping matches, using the match
     /// semantics that this automaton was constructed with.
     ///
@@ -2882,6 +2942,15 @@ unsafe impl Automaton for Arc<dyn AcAutomaton> {
         matches: &mut Vec<Match>,
     ) -> Result<(), MatchError> {
         (**self).try_find_overlapping_collect(input, matches)
+    }
+
+    #[inline(always)]
+    fn try_find_overlapping_visit(
+        &self,
+        input: &Input<'_>,
+        visit: &mut dyn FnMut(Match) -> bool,
+    ) -> Result<(), MatchError> {
+        (**self).try_find_overlapping_visit(input, visit)
     }
 
     #[inline(always)]
