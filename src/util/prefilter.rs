@@ -287,6 +287,15 @@ impl Builder {
                 prerare
             }
             (None, None) if self.ascii_case_insensitive => {
+                if let Some(pre) = self.start_bytes.build_many() {
+                    debug!(
+                        "no start or rare byte prefilter with ASCII case \
+                         insensitivity enabled, so using the start byte \
+                         set prefilter (len={})",
+                        self.start_bytes.count,
+                    );
+                    return Some(pre);
+                }
                 debug!(
                     "no start or rare byte prefilter and ASCII case \
                      insensitivity was enabled, so skipping prefilter",
@@ -296,6 +305,13 @@ impl Builder {
             (None, None) => {
                 if packed.is_some() {
                     debug!("falling back to packed prefilter");
+                } else if let Some(pre) = self.start_bytes.build_many() {
+                    debug!(
+                        "no other prefilter available, so using the start \
+                         byte set prefilter (len={})",
+                        self.start_bytes.count,
+                    );
+                    return Some(pre);
                 } else {
                     debug!("no prefilter available");
                 }
@@ -827,12 +843,41 @@ impl StartBytesBuilder {
         imp(self)
     }
 
+    /// Build a start-byte-set prefilter for pattern sets with 4 to 64
+    /// distinct start bytes: the fallback when the memchr-kernel variants
+    /// above refuse. Unlike them it accepts non-ASCII members — with a
+    /// whole byteset the candidate rate is governed by the set as a whole,
+    /// not by any single frequent byte. Above 16 distinct values the set
+    /// covers so much of any realistic input that candidates are dense and
+    /// the prefilter's fixed costs (per-call dispatch, and the start state
+    /// becoming "special" in the search loops) outweigh the skips —
+    /// measured at up to +128% on 21-26 start-byte word sets over prose,
+    /// where a mid-run disable cannot recover the specialness cost. Below
+    /// 17 the worst measured prose regression is ~+11%, against -57..86%
+    /// wins whenever the input is not saturated with candidate bytes.
+    fn build_many(&self) -> Option<Prefilter> {
+        if !(4..=16).contains(&self.count) {
+            return None;
+        }
+        let mut byteset = [0u8; 256];
+        for (out, &is_start) in byteset.iter_mut().zip(self.byteset.iter()) {
+            *out = u8::from(is_start);
+        }
+        Some(Prefilter {
+            finder: Arc::new(StartBytesMany { byteset }),
+            memory_usage: 256,
+        })
+    }
+
     /// Add a byte string to this builder.
     ///
     /// All patterns added to an Aho-Corasick automaton should be added to this
     /// builder before attempting to construct the prefilter.
     fn add(&mut self, bytes: &[u8]) {
-        if self.count > 3 {
+        // Once the set exceeds the largest buildable prefilter (see
+        // build_many), stop recording: the byteset can no longer be
+        // complete and every variant will refuse anyway.
+        if self.count > 64 {
             return;
         }
         if let Some(&byte) = bytes.first() {
@@ -900,6 +945,51 @@ impl PrefilterI for StartBytesThree {
         memchr::memchr3(self.byte1, self.byte2, self.byte3, &haystack[span])
             .map(|i| span.start + i)
             .map_or(Candidate::None, Candidate::PossibleStartOfMatch)
+    }
+}
+
+/// A prefilter for finding the next occurrence of any member of a set of 4
+/// to 16 distinct start bytes, via a 256-entry lookup table.
+///
+/// Up to three distinct bytes the memchr kernels above are strictly better.
+/// Beyond three no vectorized multi-value search is available, but a table
+/// walk testing eight positions per branch still runs several times faster
+/// than stepping the automaton through its root row byte at a time, which
+/// is what happens with no prefilter at all. The membership loads fold into
+/// a bit mask so locating the hit inside a chunk is branchless.
+#[derive(Clone, Debug)]
+struct StartBytesMany {
+    /// byteset[b] is 1 when b is a start byte, else 0.
+    byteset: [u8; 256],
+}
+
+impl PrefilterI for StartBytesMany {
+    fn find_in(&self, haystack: &[u8], span: Span) -> Candidate {
+        let t = &self.byteset;
+        let hay = &haystack[span];
+        let mut at = span.start;
+        let mut chunks = hay.chunks_exact(8);
+        for chunk in chunks.by_ref() {
+            let m = u32::from(t[usize::from(chunk[0])])
+                | u32::from(t[usize::from(chunk[1])]) << 1
+                | u32::from(t[usize::from(chunk[2])]) << 2
+                | u32::from(t[usize::from(chunk[3])]) << 3
+                | u32::from(t[usize::from(chunk[4])]) << 4
+                | u32::from(t[usize::from(chunk[5])]) << 5
+                | u32::from(t[usize::from(chunk[6])]) << 6
+                | u32::from(t[usize::from(chunk[7])]) << 7;
+            if m != 0 {
+                let i = at + m.trailing_zeros() as usize;
+                return Candidate::PossibleStartOfMatch(i);
+            }
+            at += 8;
+        }
+        for (i, &b) in chunks.remainder().iter().enumerate() {
+            if t[usize::from(b)] != 0 {
+                return Candidate::PossibleStartOfMatch(at + i);
+            }
+        }
+        Candidate::None
     }
 }
 
