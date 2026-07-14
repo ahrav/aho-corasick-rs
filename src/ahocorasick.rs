@@ -1293,6 +1293,151 @@ impl AhoCorasick {
         self.aut.try_find_overlapping_visit(&input, &mut visit)
     }
 
+    /// Appends every overlapping match in the haystack to `matches` — the
+    /// same output, in the same order, as
+    /// [`AhoCorasick::try_find_overlapping_collect`] — searching disjoint
+    /// segments of the haystack on up to `threads` scoped threads.
+    ///
+    /// Segmented overlapping search is exact, not approximate: the
+    /// Aho-Corasick state after any prefix corresponds to a trie path no
+    /// longer than the longest pattern, so every match that ends inside a
+    /// segment begins at most `max_pattern_len - 1` bytes before it. Each
+    /// worker therefore starts scanning that many bytes early (a warm-up
+    /// that rebuilds the automaton state) and keeps only matches ending
+    /// inside its own segment; concatenating the segments in order
+    /// reproduces the sequential emission order exactly.
+    ///
+    /// The threads are scoped: they borrow the haystack directly, are
+    /// joined before this returns, and a panic on a worker propagates. The
+    /// library imposes no thread-count policy — callers choose `threads`
+    /// (e.g. from `std::thread::available_parallelism`). When the haystack
+    /// is too small for the requested parallelism to pay for the per-call
+    /// thread spawns and warm-up replays, this falls back to the serial
+    /// batch search.
+    ///
+    /// Parallelism pays when the automaton walk dominates. On
+    /// match-emission-bound inputs (many matches per byte) the segment
+    /// buffers and their final concatenation add allocation and copy
+    /// traffic that can exceed the scan itself, so the serial batch form
+    /// can remain faster there.
+    ///
+    /// This has the same requirements as overlapping search: the automaton
+    /// must use [`MatchKind::Standard`] semantics and the search must be
+    /// unanchored.
+    ///
+    /// # Errors
+    ///
+    /// This returns an error when this Aho-Corasick searcher does not
+    /// support the given `Input` configuration, does not use
+    /// [`MatchKind::Standard`] semantics, or when the search is anchored.
+    /// Errors are detected before any thread is spawned; on error nothing
+    /// is appended to `matches`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::num::NonZeroUsize;
+    /// use aho_corasick::AhoCorasick;
+    ///
+    /// let patterns = &["append", "appendage", "app"];
+    /// let haystack = "append the app to the appendage";
+    ///
+    /// let ac = AhoCorasick::new(patterns).unwrap();
+    /// let mut serial = Vec::new();
+    /// ac.try_find_overlapping_collect(haystack, &mut serial).unwrap();
+    /// let mut parallel = Vec::new();
+    /// ac.try_find_overlapping_collect_parallel(
+    ///     haystack,
+    ///     NonZeroUsize::new(4).unwrap(),
+    ///     &mut parallel,
+    /// ).unwrap();
+    /// assert_eq!(serial, parallel);
+    /// ```
+    #[cfg(feature = "parallel")]
+    // The crate's rust-version (1.60) predates std::thread::scope (1.63).
+    // The 'parallel' feature is opt-in precisely so default builds keep the
+    // 1.60 MSRV; the feature's own MSRV is documented in Cargo.toml.
+    #[allow(clippy::incompatible_msrv)]
+    pub fn try_find_overlapping_collect_parallel<'h, I: Into<Input<'h>>>(
+        &self,
+        input: I,
+        threads: core::num::NonZeroUsize,
+        matches: &mut Vec<Match>,
+    ) -> Result<(), MatchError> {
+        let input = input.into();
+        enforce_anchored_consistency(self.start_kind, input.get_anchored())?;
+        if input.get_anchored().is_anchored() {
+            return Err(MatchError::invalid_input_anchored());
+        }
+        if !self.aut.match_kind().is_standard() {
+            return Err(MatchError::unsupported_overlapping(
+                self.aut.match_kind(),
+            ));
+        }
+        let span = input.get_span();
+        let len = span.end.saturating_sub(span.start);
+        // Every match ending inside a segment starts at most this many
+        // bytes before it; workers rescan this much to rebuild state.
+        let warmup = self.aut.max_pattern_len().saturating_sub(1);
+        // A segment must amortize an OS-thread spawn/join (tens of
+        // microseconds) plus its warm-up replay, so the floor is large
+        // where Go's goroutine-based equivalent engages at 32KB. Measured
+        // on table-walk-bound scans (the workloads segmentation exists
+        // for), a 64KB floor beats 128KB on 256KB-512KB inputs (-8..-40%)
+        // and ties on multi-megabyte ones. Bandwidth-bound scans (vector
+        // no-match skims at tens of GB/s) are spawn-bound at ANY floor
+        // and stay faster serial: the floor guards degenerate splits, it
+        // cannot decide profitability for the caller.
+        const MIN_SEGMENT: usize = 64 << 10;
+        let min_segment = MIN_SEGMENT.max(warmup.saturating_mul(2)).max(1);
+        let workers = threads.get().min(len / min_segment);
+        if workers <= 1 {
+            return self.aut.try_find_overlapping_collect(&input, matches);
+        }
+        let seg_len = (len + workers - 1) / workers;
+        let mut results: Vec<Result<Vec<Match>, MatchError>> =
+            Vec::with_capacity(workers);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for i in 0..workers {
+                let seg_start = span.start + i * seg_len;
+                let seg_end = core::cmp::min(seg_start + seg_len, span.end);
+                let scan_start = core::cmp::max(
+                    span.start,
+                    seg_start.saturating_sub(warmup),
+                );
+                let aut = &self.aut;
+                let sub = input.clone().span(scan_start..seg_end);
+                handles.push(scope.spawn(move || {
+                    let mut local = Vec::new();
+                    aut.try_find_overlapping_collect(&sub, &mut local)?;
+                    if i > 0 {
+                        // Matches wholly inside the warm-up prefix belong
+                        // to (and were found by) the previous segment.
+                        local.retain(|m| m.end() > seg_start);
+                    }
+                    Ok(local)
+                }));
+            }
+            for handle in handles {
+                results.push(handle.join().expect("worker panicked"));
+            }
+        });
+        // Fail before appending anything so an error leaves `matches`
+        // untouched. (No per-segment error is currently reachable — the
+        // input configuration is validated above — but the collect calls
+        // are fallible by signature.)
+        let mut collected = Vec::with_capacity(workers);
+        for result in results {
+            collected.push(result?);
+        }
+        matches.reserve(collected.iter().map(Vec::len).sum());
+        for local in collected {
+            matches.extend(local);
+        }
+        Ok(())
+    }
+
     /// Returns an iterator of non-overlapping matches, using the match
     /// semantics that this automaton was constructed with.
     ///

@@ -24,6 +24,11 @@ std = ["memchr?/std"]
 # Enables prefilter optimizations that depend on external crates.
 perf-literal = ["dep:memchr"]
 
+# Provides a parallel batch overlapping search that splits the haystack
+# across scoped threads. Requires Rust 1.63 (std::thread::scope), which is
+# why it is not part of the default feature set on this 1.60-MSRV crate.
+parallel = ["std"]
+
 # Enable logging via the 'log' crate. This is useful for seeing messages about
 # internal decisions and metrics. For example, how the choice of the internal
 # Aho-Corasick implementation is used or the heap usage of an automaton.

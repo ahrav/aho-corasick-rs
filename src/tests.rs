@@ -1662,3 +1662,59 @@ fn regression_stream_rare_byte_prefilter() {
 
     run().unwrap()
 }
+
+/// The parallel batch search must produce exactly the serial batch output —
+/// same matches, same order — across thread counts that stress segment
+/// boundaries, for every automaton kind, including the empty-pattern and
+/// too-small-to-parallelize cases.
+#[cfg(feature = "parallel")]
+#[test]
+fn parallel_collect_matches_serial() {
+    use std::num::NonZeroUsize;
+
+    let kinds = [
+        None,
+        Some(AhoCorasickKind::NoncontiguousNFA),
+        Some(AhoCorasickKind::ContiguousNFA),
+        Some(AhoCorasickKind::DFA),
+    ];
+    // Overlapping, nested and boundary-straddling patterns; the phrase mix
+    // guarantees matches at and around every segment boundary.
+    let pattern_sets: &[&[&str]] = &[
+        &["append", "appendage", "app", "pend", "end", "ndag"],
+        &["", "ab", "abab"],
+        &["aaa", "aa", "a"],
+    ];
+    let phrase = "the appendage appended an app to appease ababab aaaa ";
+    for &pats in pattern_sets {
+        for kind in kinds {
+            let ac = AhoCorasickBuilder::new().kind(kind).build(pats).unwrap();
+            // ~1.3MB: enough for several 128KB segments; plus a tiny input
+            // that must take the serial fallback.
+            for target_len in [1_300_000usize, 1_000] {
+                let mut hay = String::new();
+                while hay.len() < target_len {
+                    hay.push_str(phrase);
+                }
+                let mut serial = Vec::new();
+                ac.try_find_overlapping_collect(hay.as_str(), &mut serial)
+                    .unwrap();
+                for threads in [1usize, 2, 3, 7, 16] {
+                    let mut parallel = Vec::new();
+                    ac.try_find_overlapping_collect_parallel(
+                        hay.as_str(),
+                        NonZeroUsize::new(threads).unwrap(),
+                        &mut parallel,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        serial,
+                        parallel,
+                        "kind={kind:?} pats={pats:?} len={} threads={threads}",
+                        hay.len(),
+                    );
+                }
+            }
+        }
+    }
+}
