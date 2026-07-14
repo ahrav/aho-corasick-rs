@@ -2218,8 +2218,27 @@ impl AhoCorasickBuilder {
         // otherwise the memory usage just gets too crazy. We also only do it
         // when the start kind is unanchored or anchored, but not both, because
         // both implies two full copies of the transition table.
+        //
+        // Beyond the small-pattern case, we also take the DFA whenever its
+        // transition table stays comfortably cache-resident. The DFA costs
+        // one load per byte where the contiguous NFA may chase failure
+        // transitions, and measurements on dictionary-scale pattern sets
+        // (1k-10k words, prose and synthetic haystacks) show the DFA winning
+        // 25-60% whenever its table fits well within L2/L3, while large
+        // tables (tens of MB) lose whenever the input visits states deeply
+        // and thrash the cache. The limit is deliberately below typical L3
+        // sizes so deep scans still have room; build time roughly doubles
+        // for such sets, which is the usual determinization trade.
+        const DFA_AUTO_MEMORY_LIMIT: usize = 6 << 20;
+        let dfa_size = nfa
+            .states_len()
+            .saturating_mul(
+                nfa.byte_classes().alphabet_len().next_power_of_two(),
+            )
+            .saturating_mul(core::mem::size_of::<u32>());
         let try_dfa = !matches!(self.start_kind, StartKind::Both)
-            && nfa.patterns_len() <= 100;
+            && (nfa.patterns_len() <= 100
+                || dfa_size <= DFA_AUTO_MEMORY_LIMIT);
         if try_dfa {
             match self.dfa.build_from_noncontiguous(&nfa) {
                 Ok(dfa) => {

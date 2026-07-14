@@ -229,6 +229,13 @@ impl NFA {
         &self.byte_classes
     }
 
+    /// Returns the number of states in this NFA. Exposed so automatic engine
+    /// selection can estimate the size of the DFA this NFA would determinize
+    /// into before committing to building it.
+    pub(crate) fn states_len(&self) -> usize {
+        self.states.len()
+    }
+
     /// Returns a slice containing the length of each pattern in this searcher.
     /// It is indexed by `PatternID` and has length `NFA::patterns_len`.
     ///
