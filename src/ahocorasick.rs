@@ -2271,6 +2271,14 @@ impl AhoCorasickBuilder {
         // and thrash the cache. The limit is deliberately below typical L3
         // sizes so deep scans still have room; build time roughly doubles
         // for such sets, which is the usual determinization trade.
+        //
+        // Raising this limit is NOT a free win: at 24MB, dictionary-scale
+        // sets (10k words, 64k states, 16MB tables) sped up prose scans
+        // 19-59% but slowed input that dwells deep in the automaton by
+        // 37-104% (measured: word-concatenation haystacks), because the
+        // working set becomes the whole table. The profitable direction
+        // is shrinking the table (16-bit state ids halve it), not raising
+        // the cap.
         const DFA_AUTO_MEMORY_LIMIT: usize = 6 << 20;
         let dfa_size = nfa
             .states_len()
