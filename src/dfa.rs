@@ -614,6 +614,18 @@ unsafe impl Automaton for DFA16 {
             &self, input, matches,
         )
     }
+
+    #[inline(always)]
+    fn try_find_overlapping_visit(
+        &self,
+        input: &Input<'_>,
+        visit: &mut dyn FnMut(Match) -> bool,
+    ) -> Result<(), MatchError> {
+        // Same routing rationale as the collect override above.
+        crate::automaton::try_find_overlapping_visit_two_lane(
+            &self, input, visit,
+        )
+    }
 }
 
 impl core::fmt::Debug for DFA16 {

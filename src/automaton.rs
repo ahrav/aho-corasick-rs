@@ -1921,6 +1921,200 @@ pub(crate) fn try_find_overlapping_collect_two_lane<A: Automaton + ?Sized>(
     Ok(())
 }
 
+/// The callback form of [`try_find_overlapping_collect_two_lane`], with
+/// the same split/warm-up/filter invariants. Lane A's matches stream to
+/// the callback through a fixed buffer during the scan (they precede
+/// every lane B match globally); lane B's matches are staged in a
+/// scratch vector and drained after lane A completes. The callback is
+/// never invoked again after it returns `false`; as with the single-lane
+/// form, the scan may run further before noticing the stop.
+pub(crate) fn try_find_overlapping_visit_two_lane<A: Automaton + ?Sized>(
+    aut: &A,
+    input: &Input<'_>,
+    visit: &mut dyn FnMut(Match) -> bool,
+) -> Result<(), MatchError> {
+    if input.is_done() {
+        return Ok(());
+    }
+    if !aut.match_kind().is_standard() {
+        return Err(MatchError::unsupported_overlapping(aut.match_kind()));
+    }
+    let start = input.start();
+    let end = input.end();
+    let len = end - start;
+    let warmup = aut.max_pattern_len().saturating_sub(1);
+    // Same floor as the collect form: below it, half a span cannot
+    // outweigh the warm-up replay and lane B's staging.
+    const MIN_LANE: usize = 4 << 10;
+    if input.get_anchored().is_anchored() || len < 2 * MIN_LANE.max(warmup) {
+        return try_find_overlapping_visit(aut, input, visit);
+    }
+    let pre = aut.prefilter();
+    let anchored = input.get_anchored();
+    let haystack = input.haystack();
+    let mid = start + len / 2;
+    let b_start = core::cmp::max(start, mid - warmup);
+
+    const BUF_LEN: usize = 64;
+    let mut buf = [Match::must(0, 0..0); BUF_LEN];
+    let mut buffered = 0usize;
+    // Flushes lane A's staging buffer through the callback; `true` means
+    // the search was stopped by the callback.
+    macro_rules! flush_a {
+        () => {{
+            let mut stopped = false;
+            for m in buf[..buffered].iter().copied() {
+                if !visit(m) {
+                    stopped = true;
+                    break;
+                }
+            }
+            stopped
+        }};
+    }
+
+    let start_sid = aut.start_state(anchored)?;
+    if aut.is_match(start_sid) {
+        for i in 0..aut.match_len(start_sid) {
+            buf[buffered] = get_match(aut, start_sid, i, start);
+            buffered += 1;
+            if buffered == BUF_LEN {
+                if flush_a!() {
+                    return Ok(());
+                }
+                buffered = 0;
+            }
+        }
+    }
+    let mut bmatches = alloc::vec::Vec::new();
+
+    let mut ia = start;
+    let mut sa = start_sid;
+    let mut ib = b_start;
+    let mut sb = start_sid;
+    while ia < mid && ib < end {
+        sa = aut.next_state(anchored, sa, haystack[ia]);
+        sb = aut.next_state(anchored, sb, haystack[ib]);
+        let mut adv_a = 1;
+        if aut.is_special(sa) {
+            if aut.is_dead(sa) {
+                // A dead state ends the entire search under serial
+                // semantics: deliver what lane A found before it, drop
+                // everything lane B saw.
+                flush_a!();
+                return Ok(());
+            } else if aut.is_match(sa) {
+                let mend = ia + 1;
+                for i in 0..aut.match_len(sa) {
+                    buf[buffered] = get_match(aut, sa, i, mend);
+                    buffered += 1;
+                    if buffered == BUF_LEN {
+                        if flush_a!() {
+                            return Ok(());
+                        }
+                        buffered = 0;
+                    }
+                }
+            } else if let Some(pre) = pre {
+                debug_assert!(aut.is_start(sa));
+                match prefilter_find(pre, haystack, ia, mid) {
+                    None => {
+                        ia = mid;
+                        adv_a = 0;
+                    }
+                    Some(i) => {
+                        if i > ia {
+                            ia = i;
+                            adv_a = 0;
+                        }
+                    }
+                }
+            }
+        }
+        ia += adv_a;
+        let mut adv_b = 1;
+        if aut.is_special(sb) {
+            if aut.is_dead(sb) {
+                ib = end;
+                adv_b = 0;
+            } else if aut.is_match(sb) {
+                let mend = ib + 1;
+                if mend > mid {
+                    for i in 0..aut.match_len(sb) {
+                        bmatches.push(get_match(aut, sb, i, mend));
+                    }
+                }
+            } else if let Some(pre) = pre {
+                debug_assert!(aut.is_start(sb));
+                match prefilter_find(pre, haystack, ib, end) {
+                    None => {
+                        ib = end;
+                        adv_b = 0;
+                    }
+                    Some(i) => {
+                        if i > ib {
+                            ib = i;
+                            adv_b = 0;
+                        }
+                    }
+                }
+            }
+        }
+        ib += adv_b;
+    }
+    // Lane A remainder: keep streaming through the staging buffer.
+    'a_rem: while ia < mid {
+        sa = aut.next_state(anchored, sa, haystack[ia]);
+        if aut.is_special(sa) {
+            if aut.is_dead(sa) {
+                flush_a!();
+                return Ok(());
+            } else if aut.is_match(sa) {
+                let mend = ia + 1;
+                for i in 0..aut.match_len(sa) {
+                    buf[buffered] = get_match(aut, sa, i, mend);
+                    buffered += 1;
+                    if buffered == BUF_LEN {
+                        if flush_a!() {
+                            return Ok(());
+                        }
+                        buffered = 0;
+                    }
+                }
+            } else if let Some(pre) = pre {
+                debug_assert!(aut.is_start(sa));
+                match prefilter_find(pre, haystack, ia, mid) {
+                    None => break 'a_rem,
+                    Some(i) => {
+                        if i > ia {
+                            ia = i;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        ia += 1;
+    }
+    if flush_a!() {
+        return Ok(());
+    }
+    // Lane B remainder, then its ordered drain.
+    scan_lane(
+        aut,
+        haystack,
+        pre,
+        Lane { at: ib, to: end, sid: sb, min_end: mid, anchored },
+        &mut bmatches,
+    );
+    for m in bmatches {
+        if !visit(m) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 /// One lane of the two-lane scan: the byte range still to walk, the
 /// automaton state to walk it from, and the emission floor (matches must
 /// end strictly after `min_end`).
