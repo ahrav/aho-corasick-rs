@@ -1626,6 +1626,7 @@ fn try_find_overlapping_fwd_imp<A: Automaton + ?Sized>(
 /// emission to the incremental form (start-state matches first, then every
 /// pattern at each match state, in state order), but with no per-match exit
 /// from the loop.
+///
 fn try_find_overlapping_collect<A: Automaton + ?Sized>(
     aut: &A,
     input: &Input<'_>,
@@ -1813,7 +1814,22 @@ pub(crate) fn try_find_overlapping_collect_two_lane<A: Automaton + ?Sized>(
     // (lane B's allocation dominates) while 8KB inputs already win.
     const MIN_LANE: usize = 4 << 10;
     if input.get_anchored().is_anchored() || len < 2 * MIN_LANE.max(warmup) {
-        return try_find_overlapping_collect(aut, input, matches);
+        // Outlined so the fallback keeps its own register allocation:
+        // inlined here it shares one allocation with the interleaved loop
+        // below, which measurably degrades the fallback's emission path
+        // (+12..14% on 1-4KB dictionary scans when that shared allocation
+        // shifted). Outlining the shared serial implementation itself
+        // instead costs the OTHER engines' inlined entry points 4..18%,
+        // so only this private wrapper is outlined.
+        #[inline(never)]
+        fn fallback<A: Automaton + ?Sized>(
+            aut: &A,
+            input: &Input<'_>,
+            matches: &mut alloc::vec::Vec<Match>,
+        ) -> Result<(), MatchError> {
+            try_find_overlapping_collect(aut, input, matches)
+        }
+        return fallback(aut, input, matches);
     }
     let pre = aut.prefilter();
     let anchored = input.get_anchored();
