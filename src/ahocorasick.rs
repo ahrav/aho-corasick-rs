@@ -2229,14 +2229,14 @@ impl AhoCorasick {
     ///     .kind(None) // default
     ///     .build(&["foobar", "bruce", "triskaidekaphobia", "springsteen"])
     ///     .unwrap();
-    /// assert_eq!(5_632, ac.memory_usage());
+    /// assert_eq!(5_556, ac.memory_usage());
     ///
     /// let ac = AhoCorasick::builder()
     ///     .kind(None) // default
     ///     .ascii_case_insensitive(true)
     ///     .build(&["foobar", "bruce", "triskaidekaphobia", "springsteen"])
     ///     .unwrap();
-    /// assert_eq!(11_392, ac.memory_usage());
+    /// assert_eq!(11_316, ac.memory_usage());
     ///
     /// let ac = AhoCorasick::builder()
     ///     .kind(Some(AhoCorasickKind::NoncontiguousNFA))
@@ -2263,7 +2263,7 @@ impl AhoCorasick {
     /// // will reveal that the rate of growth of the DFA is far bigger than
     /// // the NFAs above. For a large number of patterns, it is easy for the
     /// // DFA to take an order of magnitude more heap space (or more!).
-    /// assert_eq!(11_392, ac.memory_usage());
+    /// assert_eq!(11_316, ac.memory_usage());
     /// ```
     pub fn memory_usage(&self) -> usize {
         self.aut.memory_usage()
