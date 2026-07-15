@@ -1778,6 +1778,201 @@ fn try_find_overlapping_visit<A: Automaton + ?Sized>(
     Ok(())
 }
 
+/// A two-lane interleaved batch overlapping search, for automatons whose
+/// transition table exceeds the cache: splits the span at the midpoint,
+/// walks both halves in one loop with two independent state chains, and
+/// concatenates the halves' matches in order. The two chains give the CPU
+/// two table loads in flight, overlapping the miss latency that dominates
+/// large-table scans; on cache-resident engines the extra bookkeeping is
+/// a pure loss (measured +7..38% when tried generically), so only
+/// large-table implementations route here.
+///
+/// The second lane replays `max_pattern_len - 1` warm-up bytes before the
+/// midpoint to rebuild the automaton state (the state after any prefix
+/// corresponds to a trie path no longer than the longest pattern) and
+/// emits only matches ending strictly after the midpoint, which the first
+/// lane cannot have: identical emission set and order to the serial scan.
+pub(crate) fn try_find_overlapping_collect_two_lane<A: Automaton + ?Sized>(
+    aut: &A,
+    input: &Input<'_>,
+    matches: &mut alloc::vec::Vec<Match>,
+) -> Result<(), MatchError> {
+    if input.is_done() {
+        return Ok(());
+    }
+    if !aut.match_kind().is_standard() {
+        return Err(MatchError::unsupported_overlapping(aut.match_kind()));
+    }
+    let start = input.start();
+    let end = input.end();
+    let len = end - start;
+    let warmup = aut.max_pattern_len().saturating_sub(1);
+    // Below this, half a span cannot outweigh the second lane's warm-up
+    // replay and the scratch buffer for its matches: measured on the
+    // dictionary corpora, 2KB lanes still lose 2..15% on 4KB inputs
+    // (lane B's allocation dominates) while 8KB inputs already win.
+    const MIN_LANE: usize = 4 << 10;
+    if input.get_anchored().is_anchored() || len < 2 * MIN_LANE.max(warmup) {
+        return try_find_overlapping_collect(aut, input, matches);
+    }
+    let pre = aut.prefilter();
+    let anchored = input.get_anchored();
+    let haystack = input.haystack();
+    let mid = start + len / 2;
+    let b_start = core::cmp::max(start, mid - warmup);
+
+    let start_sid = aut.start_state(anchored)?;
+    // The empty string may be in the automaton: report start-state matches
+    // at the starting position, exactly like the serial form (lane B's
+    // start-state entry lies at or before `mid` and is filtered out).
+    if aut.is_match(start_sid) {
+        for i in 0..aut.match_len(start_sid) {
+            matches.push(get_match(aut, start_sid, i, start));
+        }
+    }
+    let mut bmatches = alloc::vec::Vec::new();
+
+    let mut ia = start;
+    let mut sa = start_sid;
+    let mut ib = b_start;
+    let mut sb = start_sid;
+    // Interleaved phase: one iteration advances both lanes one byte. A
+    // lane whose prefilter reports no further candidates jumps its cursor
+    // to its end, which both terminates this loop and skips its drain.
+    while ia < mid && ib < end {
+        sa = aut.next_state(anchored, sa, haystack[ia]);
+        sb = aut.next_state(anchored, sb, haystack[ib]);
+        let mut adv_a = 1;
+        if aut.is_special(sa) {
+            if aut.is_dead(sa) {
+                // A dead state ends the entire search under serial
+                // semantics, making everything lane B saw unreachable.
+                // (Not reachable for the unanchored dense-table automatons
+                // that route here, but kept exact.)
+                return Ok(());
+            } else if aut.is_match(sa) {
+                let mend = ia + 1;
+                for i in 0..aut.match_len(sa) {
+                    matches.push(get_match(aut, sa, i, mend));
+                }
+            } else if let Some(pre) = pre {
+                debug_assert!(aut.is_start(sa));
+                match prefilter_find(pre, haystack, ia, mid) {
+                    None => {
+                        ia = mid;
+                        adv_a = 0;
+                    }
+                    Some(i) => {
+                        if i > ia {
+                            ia = i;
+                            adv_a = 0;
+                        }
+                    }
+                }
+            }
+        }
+        ia += adv_a;
+        let mut adv_b = 1;
+        if aut.is_special(sb) {
+            if aut.is_dead(sb) {
+                ib = end;
+                adv_b = 0;
+            } else if aut.is_match(sb) {
+                let mend = ib + 1;
+                if mend > mid {
+                    for i in 0..aut.match_len(sb) {
+                        bmatches.push(get_match(aut, sb, i, mend));
+                    }
+                }
+            } else if let Some(pre) = pre {
+                debug_assert!(aut.is_start(sb));
+                match prefilter_find(pre, haystack, ib, end) {
+                    None => {
+                        ib = end;
+                        adv_b = 0;
+                    }
+                    Some(i) => {
+                        if i > ib {
+                            ib = i;
+                            adv_b = 0;
+                        }
+                    }
+                }
+            }
+        }
+        ib += adv_b;
+    }
+    // Drain whichever lane still has bytes (at most one does).
+    scan_lane(
+        aut,
+        haystack,
+        pre,
+        Lane { at: ia, to: mid, sid: sa, min_end: start, anchored },
+        matches,
+    );
+    scan_lane(
+        aut,
+        haystack,
+        pre,
+        Lane { at: ib, to: end, sid: sb, min_end: mid, anchored },
+        &mut bmatches,
+    );
+    matches.append(&mut bmatches);
+    Ok(())
+}
+
+/// One lane of the two-lane scan: the byte range still to walk, the
+/// automaton state to walk it from, and the emission floor (matches must
+/// end strictly after `min_end`).
+struct Lane {
+    at: usize,
+    to: usize,
+    sid: StateID,
+    min_end: usize,
+    anchored: Anchored,
+}
+
+/// The single-lane remainder of the two-lane scan: a serial walk of
+/// `[lane.at, lane.to)` appending matches with `end > lane.min_end` to
+/// `out`.
+#[inline(always)]
+fn scan_lane<A: Automaton + ?Sized>(
+    aut: &A,
+    haystack: &[u8],
+    pre: Option<&Prefilter>,
+    lane: Lane,
+    out: &mut alloc::vec::Vec<Match>,
+) {
+    let Lane { mut at, to, mut sid, min_end, anchored } = lane;
+    while at < to {
+        sid = aut.next_state(anchored, sid, haystack[at]);
+        if aut.is_special(sid) {
+            if aut.is_dead(sid) {
+                return;
+            } else if aut.is_match(sid) {
+                let mend = at + 1;
+                if mend > min_end {
+                    for i in 0..aut.match_len(sid) {
+                        out.push(get_match(aut, sid, i, mend));
+                    }
+                }
+            } else if let Some(pre) = pre {
+                debug_assert!(aut.is_start(sid));
+                match prefilter_find(pre, haystack, at, to) {
+                    None => return,
+                    Some(i) => {
+                        if i > at {
+                            at = i;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        at += 1;
+    }
+}
+
 #[inline(always)]
 fn get_match<A: Automaton + ?Sized>(
     aut: &A,

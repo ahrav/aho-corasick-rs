@@ -18,7 +18,7 @@ use crate::{
         int::{Usize, U32},
         prefilter::Prefilter,
         primitives::{IteratorIndexExt, PatternID, SmallIndex, StateID},
-        search::{Anchored, MatchKind, StartKind},
+        search::{Anchored, Input, Match, MatchKind, StartKind},
         special::Special,
     },
 };
@@ -596,6 +596,23 @@ unsafe impl Automaton for DFA16 {
     #[inline(always)]
     fn prefilter(&self) -> Option<&Prefilter> {
         self.prefilter.as_ref()
+    }
+
+    #[inline(always)]
+    fn try_find_overlapping_collect(
+        &self,
+        input: &Input<'_>,
+        matches: &mut Vec<Match>,
+    ) -> Result<(), MatchError> {
+        // This table is only auto-selected when it does NOT fit the cache
+        // (the full-width DFA takes the cache-resident band), so the scan
+        // is bound by the latency of the per-byte table load. The two-lane
+        // pass keeps two independent loads in flight; on cache-resident
+        // engines the same transform is a pinned loss, which is why the
+        // routing lives here and not in the shared default.
+        crate::automaton::try_find_overlapping_collect_two_lane(
+            &self, input, matches,
+        )
     }
 }
 
